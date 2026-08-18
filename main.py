@@ -6,61 +6,52 @@ import requests
 from flask import Flask
 
 # ==========================================
-# ⚙️ 1. CONFIGURATIONS & TIMEZONE (UTC+7)
+# ⚙️ 1. CONFIGURATIONS & TIMEZONE
 # ==========================================
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1538096079202160670/x-zE6zkW2nWT0um6710IwtmP91D8rL1vpHLEoXpyrykpLBcskx_LLs4fx8cOfFXj98M1"
 
 TZ_LOCAL = datetime.timezone(datetime.timedelta(hours=7))
 
-PAIRS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "BNBUSDT",
-    "XRPUSDT",
-    "DOGEUSDT",
-    "ADAUSDT",
-    "AVAXUSDT",
-    "NEARUSDT",
-    "DOTUSDT",
-]
+# เลือกเฉพาะเหรียญที่มี Volume สูง เพื่อให้กราฟตรงกับ BXTrade มากที่สุด
+PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 app = Flask(__name__)
 
 
 @app.route("/")
 def home():
-    return "High-Confluence Bot is running!"
+    return "BXTrade 30s High-Precision Bot is running!"
 
 
 def run_flask():
     app.run(host="0.0.0.0", port=8080)
 
 
-def get_binance_data(symbol, interval="1m", limit=100):
+def get_binance_data(symbol, interval="1m", limit=30):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
             df = pd.DataFrame(
-                data,
+                res.json(),
                 columns=[
-                    "timestamp",
+                    "time",
                     "open",
                     "high",
                     "low",
                     "close",
                     "volume",
                     "close_time",
-                    "quote_asset_volume",
-                    "number_of_trades",
-                    "taker_buy_base_asset_volume",
-                    "taker_buy_quote_asset_volume",
+                    "qav",
+                    "num_trades",
+                    "tb_base",
+                    "tb_quote",
                     "ignore",
                 ],
             )
             df["close"] = df["close"].astype(float)
+            df["open"] = df["open"].astype(float)
+            df["volume"] = df["volume"].astype(float)
             return df
     except Exception as e:
         print(f"Error fetching {symbol}: {e}")
@@ -75,61 +66,69 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def calculate_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def analyze_bxtrade_30s(symbol):
+    # 1. เช็กเทรนด์คุมทิศทาง 5m
+    df_5m = get_binance_data(symbol, interval="5m", limit=30)
+    # 2. เช็กจุดกลับตัวสั้น 1m
+    df_1m = get_binance_data(symbol, interval="1m", limit=30)
 
-
-def analyze_pair_strict(symbol):
-    # 1. ดึงข้อมูล 15 นาที เพื่อดู "เทรนด์ใหญ่"
-    df_15m = get_binance_data(symbol, interval="15m", limit=50)
-    if df_15m is None or len(df_15m) < 30:
+    if df_5m is None or df_1m is None or len(df_1m) < 20:
         return None
 
-    df_15m["EMA20"] = calculate_ema(df_15m["close"], 20)
-    df_15m["EMA50"] = calculate_ema(df_15m["close"], 50)
-    trend_15m = (
-        "UP"
-        if df_15m.iloc[-1]["EMA20"] > df_15m.iloc[-1]["EMA50"]
-        else "DOWN"
+    # คำนวณ EMA กรองเทรนด์ใหญ่
+    df_5m["EMA20"] = df_5m["close"].ewm(span=20, adjust=False).mean()
+    df_5m["EMA50"] = df_5m["close"].ewm(span=50, adjust=False).mean()
+    trend_5m = (
+        "UP" if df_5m.iloc[-1]["EMA20"] > df_5m.iloc[-1]["EMA50"] else "DOWN"
     )
 
-    # 2. ดึงข้อมูล 1 นาที เพื่อหา "จุดเข้าเทรด"
-    df_1m = get_binance_data(symbol, interval="1m", limit=50)
-    if df_1m is None or len(df_1m) < 30:
-        return None
-
+    # คำนวณ RSI & Momentum
     df_1m["RSI"] = calculate_rsi(df_1m["close"], 14)
-    df_1m["EMA20"] = calculate_ema(df_1m["close"], 20)
+    df_1m["EMA10"] = df_1m["close"].ewm(span=10, adjust=False).mean()
 
-    latest_1m = df_1m.iloc[-1]
-    price = latest_1m["close"]
-    rsi_1m = round(latest_1m["RSI"], 2)
-    ema20_1m = latest_1m["EMA20"]
+    curr = df_1m.iloc[-1]
+    prev = df_1m.iloc[-2]
+
+    price = curr["close"]
+    rsi_curr = curr["RSI"]
+    rsi_prev = prev["RSI"]
 
     signal = None
 
-    # เงื่อนไข BUY: เทรนด์ใหญ่เป็นขาขึ้น + กราฟ 1m ย่อตัวลงมา RSI < 35 (Oversold) + ราคาเริ่มยืนเหนือ EMA20
-    if trend_15m == "UP" and rsi_1m <= 35 and price > ema20_1m:
-        signal = "🟢 HIGH-CONFIRM BUY"
+    # เงื่อนไข CALL (BUY 30s): เทรนด์ 5m ขึ้น + RSI ย่อตัวแล้วตัดกลับขึ้น + ราคายืนเหนือ EMA10
+    if (
+        trend_5m == "UP"
+        and rsi_prev < 42
+        and rsi_curr >= 42
+        and price > curr["EMA10"]
+    ):
+        signal = "🟢 CALL (กดซื้อขึ้น 30 วิ)"
 
-    # เงื่อนไข SELL: เทรนด์ใหญ่เป็นขาลง + กราฟ 1m เด้งขึ้นไป RSI > 65 (Overbought) + ราคาเริ่มหลุด EMA20
-    elif trend_15m == "DOWN" and rsi_1m >= 65 and price < ema20_1m:
-        signal = "🔴 HIGH-CONFIRM SELL"
+    # เงื่อนไข PUT (SELL 30s): เทรนด์ 5m ลง + RSI เด้งแล้วตัดกลับลง + ราคาหลุดใต้ EMA10
+    elif (
+        trend_5m == "DOWN"
+        and rsi_prev > 58
+        and rsi_curr <= 58
+        and price < curr["EMA10"]
+    ):
+        signal = "🔴 PUT (กดซื้อลง 30 วิ)"
 
     if signal:
-        formatted_pair = symbol.replace("USDT", "USDm")
-        current_time = datetime.datetime.now(TZ_LOCAL).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        now = datetime.datetime.now(TZ_LOCAL)
+        curr_time = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        # คำนวณเวลานับถอยหลังให้ส่งเตือนล่วงหน้า 6-8 วินาที
+        sec = now.second
+        rem_sec = 30 - (sec % 30)
 
         msg = (
-            f"🎯 **[Strict Signal Verified]**\n"
-            f"⏰ Time: {current_time}\n"
-            f"📊 Pair: {formatted_pair}\n"
-            f"🚀 Signal: {signal}\n"
-            f"🌊 15m Trend: {trend_15m}\n"
-            f"📈 1m RSI: {rsi_1m:.2f}\n"
-            f"📉 Price: {price:.2f}"
+            f"⚡ **[BXTrade 30s Signal Verified]**\n"
+            f"⏰ เวลาเตือน: {curr_time}\n"
+            f"📊 เหรียญ: {symbol.replace('USDT', '')}\n"
+            f"🎯 คำสั่ง: **{signal}**\n"
+            f"🌊 เทรนด์หลัก 5m: {trend_5m}\n"
+            f"📉 ราคา Binance: {price:.2f}\n"
+            f"⏳ **เตรียมกดออเดอร์ใน BXTrade ในอีก {rem_sec} วินาที (กดก่อนหมดเวลา 6-8 วิ)**"
         )
         return msg
     return None
@@ -144,25 +143,32 @@ def send_discord_message(message):
 
 
 def bot_loop():
-    print("🤖 High-Confluence Bot Started (Strict Filters Active)...")
-    last_processed_min = -1
+    print("🤖 BXTrade 30s High-Precision Bot Active...")
+    send_discord_message("🟢 บอท BXTrade 30s เริ่มสแกนกราฟเรียบร้อยแล้ว!")
+    last_sent_time = 0
 
     while True:
         now = datetime.datetime.now(TZ_LOCAL)
+        current_timestamp = time.time()
 
-        if now.minute % 2 == 0 and now.minute != last_processed_min:
-            last_processed_min = now.minute
+        # เช็กเฉพาะช่วงวินาทีที่ 22-24 หรือ 52-54 เพื่อให้ตรงสเปก "ส่งก่อนหมดเวลาซื้อ 6-8 วินาที"
+        sec = now.second
+        is_target_second = (22 <= sec <= 24) or (52 <= sec <= 54)
 
+        # ตั้งระยะห่างส่งสัญญาณทุกๆ 15-30 นาที (ไม่ยิงซ้ำติดกันเกินไป)
+        if is_target_second and (current_timestamp - last_sent_time > 900):
             for symbol in PAIRS:
                 try:
-                    msg = analyze_pair_strict(symbol)
+                    msg = analyze_bxtrade_30s(symbol)
                     if msg:
                         send_discord_message(msg)
-                        time.sleep(1.5)
+                        last_sent_time = current_timestamp
+                        time.sleep(2)
+                        break
                 except Exception as e:
                     print(f"Error processing {symbol}: {e}")
 
-        time.sleep(5)
+        time.sleep(1)
 
 
 if __name__ == "__main__":
