@@ -6,13 +6,13 @@ import requests
 from flask import Flask
 
 # ==========================================
-# ⚙️ 1. CONFIGURATIONS & TIMEZONE
+# ⚙️ CONFIGURATIONS & TIMEZONE
 # ==========================================
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1538096079202160670/x-zE6zkW2nWT0um6710IwtmP91D8rL1vpHLEoXpyrykpLBcskx_LLs4fx8cOfFXj98M1"
 
 TZ_LOCAL = datetime.timezone(datetime.timedelta(hours=7))
 
-# เลือกเฉพาะเหรียญที่มี Volume สูง เพื่อให้กราฟตรงกับ BXTrade มากที่สุด
+# Major high-volume trading pairs
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 app = Flask(__name__)
@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "BXTrade 30s High-Precision Bot is running!"
+    return "BXTrade 30s Bot is active!"
 
 
 def run_flask():
@@ -51,7 +51,6 @@ def get_binance_data(symbol, interval="1m", limit=30):
             )
             df["close"] = df["close"].astype(float)
             df["open"] = df["open"].astype(float)
-            df["volume"] = df["volume"].astype(float)
             return df
     except Exception as e:
         print(f"Error fetching {symbol}: {e}")
@@ -67,22 +66,20 @@ def calculate_rsi(series, period=14):
 
 
 def analyze_bxtrade_30s(symbol):
-    # 1. เช็กเทรนด์คุมทิศทาง 5m
     df_5m = get_binance_data(symbol, interval="5m", limit=30)
-    # 2. เช็กจุดกลับตัวสั้น 1m
     df_1m = get_binance_data(symbol, interval="1m", limit=30)
 
     if df_5m is None or df_1m is None or len(df_1m) < 20:
         return None
 
-    # คำนวณ EMA กรองเทรนด์ใหญ่
+    # 5-minute major trend
     df_5m["EMA20"] = df_5m["close"].ewm(span=20, adjust=False).mean()
     df_5m["EMA50"] = df_5m["close"].ewm(span=50, adjust=False).mean()
     trend_5m = (
         "UP" if df_5m.iloc[-1]["EMA20"] > df_5m.iloc[-1]["EMA50"] else "DOWN"
     )
 
-    # คำนวณ RSI & Momentum
+    # 1-minute reversal points
     df_1m["RSI"] = calculate_rsi(df_1m["close"], 14)
     df_1m["EMA10"] = df_1m["close"].ewm(span=10, adjust=False).mean()
 
@@ -95,40 +92,34 @@ def analyze_bxtrade_30s(symbol):
 
     signal = None
 
-    # เงื่อนไข CALL (BUY 30s): เทรนด์ 5m ขึ้น + RSI ย่อตัวแล้วตัดกลับขึ้น + ราคายืนเหนือ EMA10
     if (
         trend_5m == "UP"
-        and rsi_prev < 42
-        and rsi_curr >= 42
+        and rsi_prev < 45
+        and rsi_curr >= 45
         and price > curr["EMA10"]
     ):
-        signal = "🟢 CALL (กดซื้อขึ้น 30 วิ)"
-
-    # เงื่อนไข PUT (SELL 30s): เทรนด์ 5m ลง + RSI เด้งแล้วตัดกลับลง + ราคาหลุดใต้ EMA10
+        signal = "🟢 CALL (BUY HIGHER 30s)"
     elif (
         trend_5m == "DOWN"
-        and rsi_prev > 58
-        and rsi_curr <= 58
+        and rsi_prev > 55
+        and rsi_curr <= 55
         and price < curr["EMA10"]
     ):
-        signal = "🔴 PUT (กดซื้อลง 30 วิ)"
+        signal = "🔴 PUT (BUY LOWER 30s)"
 
     if signal:
         now = datetime.datetime.now(TZ_LOCAL)
-        curr_time = now.strftime("%Y-%m-%d %H:%M:%S")
+        curr_time = now.strftime("%H:%M:%S")
 
-        # คำนวณเวลานับถอยหลังให้ส่งเตือนล่วงหน้า 6-8 วินาที
         sec = now.second
         rem_sec = 30 - (sec % 30)
 
         msg = (
-            f"⚡ **[BXTrade 30s Signal Verified]**\n"
-            f"⏰ เวลาเตือน: {curr_time}\n"
-            f"📊 เหรียญ: {symbol.replace('USDT', '')}\n"
-            f"🎯 คำสั่ง: **{signal}**\n"
-            f"🌊 เทรนด์หลัก 5m: {trend_5m}\n"
-            f"📉 ราคา Binance: {price:.2f}\n"
-            f"⏳ **เตรียมกดออเดอร์ใน BXTrade ในอีก {rem_sec} วินาที (กดก่อนหมดเวลา 6-8 วิ)**"
+            f"⚡ **[BXTrade 30s Signal]**\n"
+            f"⏰ Time: {curr_time}\n"
+            f"📊 Symbol: {symbol.replace('USDT', '')}\n"
+            f"🎯 Signal: **{signal}**\n"
+            f"⏳ **Prepare order in {rem_sec}s (10-15s advance alert)**"
         )
         return msg
     return None
@@ -143,19 +134,20 @@ def send_discord_message(message):
 
 
 def bot_loop():
-    print("🤖 BXTrade 30s High-Precision Bot Active...")
-    send_discord_message("🟢 บอท BXTrade 30s เริ่มสแกนกราฟเรียบร้อยแล้ว!")
+    print("🤖 BXTrade 30s Bot Started...")
+    send_discord_message(
+        "🟢 BXTrade 30s Bot active! (10-15s advance alerts)"
+    )
     last_sent_time = 0
 
     while True:
         now = datetime.datetime.now(TZ_LOCAL)
         current_timestamp = time.time()
 
-        # เช็กเฉพาะช่วงวินาทีที่ 22-24 หรือ 52-54 เพื่อให้ตรงสเปก "ส่งก่อนหมดเวลาซื้อ 6-8 วินาที"
+        # Target seconds 15-18 or 45-48 for exact 10-15s advance notifications
         sec = now.second
-        is_target_second = (22 <= sec <= 24) or (52 <= sec <= 54)
+        is_target_second = (15 <= sec <= 18) or (45 <= sec <= 48)
 
-        # ตั้งระยะห่างส่งสัญญาณทุกๆ 15-30 นาที (ไม่ยิงซ้ำติดกันเกินไป)
         if is_target_second and (current_timestamp - last_sent_time > 900):
             for symbol in PAIRS:
                 try:
@@ -177,3 +169,4 @@ if __name__ == "__main__":
     server_thread.start()
 
     bot_loop()
+        
